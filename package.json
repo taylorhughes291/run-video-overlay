@@ -1,0 +1,23 @@
+{
+  "name": "run-video-overlay",
+  "version": "1.0.0",
+  "description": "export transparent dahsboard overlay videos from Garmin .fit files over a transparent background",
+  "license": "ISC",
+  "author": "Taylor Hughes",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo 'No tests yet'",
+    "fit:read": "node ./bin/fit-read.js",
+    "fit:video": "node ./bin/fit-to-video.js"
+  },
+  "bin": {
+    "fit-read": "./bin/fit-read.js",
+    "fit-to-video": "./bin/fit-to-video.js"
+  },
+  "dependencies": {
+    "fit-file-parser": "^1.21.0",
+    "fluent-ffmpeg": "^2.1.3",
+    "puppeteer": "^24.27.0"
+  }
+}
