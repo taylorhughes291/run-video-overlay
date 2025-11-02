@@ -350,13 +350,148 @@ function extractSegments(data) {
   return segments;
 }
 
+function extractHeartRateData(filePath) {
+  // Parse FIT file with 'both' mode to get records
+  const content = fs.readFileSync(filePath);
+  const parser = new FitParser({
+    force: true,
+    speedUnit: "m/s",
+    lengthUnit: "m",
+    temperatureUnit: "celsius",
+    elapsedRecordField: true,
+    mode: "both", // Need 'both' mode to get records
+  });
+
+  return new Promise((resolve) => {
+    parser.parse(content, (err, parsedData) => {
+      if (err || !parsedData.records || parsedData.records.length === 0) {
+        resolve([]);
+        return;
+      }
+
+      const records = parsedData.records;
+      const heartRateData = [];
+      const startTime = records[0].timestamp
+        ? new Date(records[0].timestamp).getTime()
+        : null;
+
+      records.forEach((record) => {
+        if (record.heart_rate !== undefined && record.timestamp && startTime) {
+          const recordTime = new Date(record.timestamp).getTime();
+          const elapsed = (recordTime - startTime) / 1000; // seconds
+          heartRateData.push({
+            time: elapsed,
+            heartRate: record.heart_rate,
+          });
+        }
+      });
+
+      resolve(heartRateData);
+    });
+  });
+}
+
+function extractDistanceData(filePath) {
+  // Parse FIT file with 'both' mode to get records
+  const content = fs.readFileSync(filePath);
+  const parser = new FitParser({
+    force: true,
+    speedUnit: "m/s",
+    lengthUnit: "m",
+    temperatureUnit: "celsius",
+    elapsedRecordField: true,
+    mode: "both", // Need 'both' mode to get records
+  });
+
+  return new Promise((resolve) => {
+    parser.parse(content, (err, parsedData) => {
+      if (err || !parsedData.records || parsedData.records.length === 0) {
+        resolve({ distanceData: [], totalDistance: 0, paceData: [] });
+        return;
+      }
+
+      const records = parsedData.records;
+      const distanceData = [];
+      const paceData = [];
+      const startTime = records[0].timestamp
+        ? new Date(records[0].timestamp).getTime()
+        : null;
+      let totalDistance = 0;
+      let lastDistance = 0;
+      let lastTime = 0;
+
+      records.forEach((record, index) => {
+        if (record.timestamp && startTime) {
+          const recordTime = new Date(record.timestamp).getTime();
+          const elapsed = (recordTime - startTime) / 1000; // seconds
+
+          if (record.distance !== undefined) {
+            // Distance is cumulative in meters
+            totalDistance = record.distance;
+            distanceData.push({
+              time: elapsed,
+              distance: record.distance, // in meters
+            });
+
+            // Calculate pace from distance change
+            // Pace = time per mile = (time change in minutes) / (distance change in miles)
+            if (
+              index > 0 &&
+              elapsed > lastTime &&
+              record.distance > lastDistance
+            ) {
+              const timeDiffMinutes = (elapsed - lastTime) / 60;
+              const distanceDiffMiles =
+                (record.distance - lastDistance) / 1609.34;
+
+              if (distanceDiffMiles > 0) {
+                const paceMinutesPerMile = timeDiffMinutes / distanceDiffMiles;
+                paceData.push({
+                  time: elapsed,
+                  pace: paceMinutesPerMile, // minutes per mile
+                });
+              }
+            }
+
+            lastDistance = record.distance;
+            lastTime = elapsed;
+          } else if (
+            record.enhanced_speed !== undefined &&
+            record.enhanced_speed > 0
+          ) {
+            // Calculate pace from speed (m/s)
+            // Pace (min/mile) = 1 / (speed in miles per minute)
+            // speed is in m/s, so convert: miles per minute = (m/s) * 60 / 1609.34
+            const speedMph = (record.enhanced_speed * 3600) / 1609.34;
+            const paceMinutesPerMile = 60 / speedMph; // minutes per mile
+            paceData.push({
+              time: elapsed,
+              pace: paceMinutesPerMile,
+            });
+          }
+        }
+      });
+
+      resolve({
+        distanceData,
+        totalDistance: totalDistance || 0,
+        paceData,
+      });
+    });
+  });
+}
+
 function generateHTMLTemplate(
   segments,
   totalDurationForSizing,
   width,
   height,
-  videoDuration
+  videoDuration,
+  heartRateData,
+  distanceData
 ) {
+  // Extract pace data from distance data
+  const paceData = (distanceData && distanceData.paceData) || [];
   // Calculate segment positions and widths
   const barHeight = 120;
   const barY = 40;
@@ -366,10 +501,11 @@ function generateHTMLTemplate(
   const usableWidth = availableWidth - totalMarginWidth;
   const totalDuration = totalDurationForSizing || videoDuration;
 
-  // Background bar extends from top to below bars by same distance as top margin
+  // Background bar extends from top to below bars by same distance as top margin + extra space for duration text
   // Top margin is barY (40px), bars are at barY with height barHeight (120px)
-  // So bars end at barY + barHeight (160px), extend another barY (40px) below = 200px total
-  const backgroundBarHeight = barY + barHeight + barY; // 40 + 120 + 40 = 200px
+  // Duration text is below the bars with margin (10px + text height ~30px = ~40px)
+  // So bars end at barY + barHeight (160px), extend barY (40px) + extra 20px below = 220px total
+  const backgroundBarHeight = barY + barHeight + barY + 20; // 40 + 120 + 40 + 20 = 220px
 
   // Generate segment styles and HTML
   let segmentHTML = "";
@@ -401,18 +537,26 @@ function generateHTMLTemplate(
     if (segment.targetPace !== null && segment.targetPace !== undefined) {
       const mins = Math.floor(segment.targetPace);
       const secs = Math.round((segment.targetPace - mins) * 60);
-      paceText = `${mins}:${secs.toString().padStart(2, "0")}`;
+      paceText = `${mins}:${secs.toString().padStart(2, "0")} min/mile`;
     }
 
     // Calculate animation timing
     const animationStart = segmentStart;
     const animationEnd = segmentStart + segmentDuration;
 
+    // Format duration (convert seconds to minutes:seconds)
+    const durationMins = Math.floor(segmentDuration / 60);
+    const durationSecs = Math.floor(segmentDuration % 60);
+    const durationText = `Duration: ${durationMins}:${durationSecs
+      .toString()
+      .padStart(2, "0")}`;
+
     segmentHTML += `
     <div class="segment" style="left: ${currentX}px; width: ${actualBarWidth}px;">
       <div class="segment-border" style="border-color: ${color};"></div>
       <div class="segment-fill" style="background-color: ${color};" data-start="${animationStart}" data-duration="${segmentDuration}"></div>
       ${paceText ? `<div class="segment-pace">${paceText}</div>` : ""}
+      <div class="segment-duration">${durationText}</div>
     </div>`;
 
     currentX += actualBarWidth + segmentMargin;
@@ -489,6 +633,108 @@ function generateHTMLTemplate(
       z-index: 10;
     }
 
+    .segment-duration {
+      position: absolute;
+      top: 100%;
+      left: 0;
+      margin-top: 10px;
+      color: white;
+      font-size: 32px;
+      font-weight: bold;
+      text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.8);
+      z-index: 10;
+    }
+
+    .heart-rate {
+      position: absolute;
+      bottom: 180px;
+      left: 60px;
+      color: white;
+      font-size: 64px;
+      font-weight: bold;
+      text-shadow: 2px 2px 6px rgba(0, 0, 0, 0.9);
+      z-index: 10;
+      font-family: Arial, sans-serif;
+    }
+
+    .heart-rate-label {
+      font-size: 32px;
+      opacity: 0.9;
+      margin-right: 10px;
+    }
+
+    .heart-rate-value {
+      font-size: 64px;
+    }
+
+    .distance-bar-container {
+      position: absolute;
+      bottom: 60px;
+      left: 60px;
+      width: 500px;
+      height: 75px;
+      z-index: 10;
+    }
+
+    .distance-bar-background {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background-color: rgba(128, 128, 128, 0.65);
+      border: 2px solid white;
+      border-radius: 2px;
+    }
+
+    .distance-bar-fill {
+      position: absolute;
+      top: 0;
+      left: 0;
+      height: 100%;
+      width: 0%;
+      background-color: rgba(255, 255, 255, 0.8);
+      border-radius: 2px;
+      transition: none;
+    }
+
+    .distance-value {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      color: white;
+      font-size: 32px;
+      font-weight: bold;
+      text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.9);
+      z-index: 11;
+      white-space: nowrap;
+    }
+
+    .current-pace {
+      position: absolute;
+      bottom: 140px;
+      right: 60px;
+      color: white;
+      font-size: 48px;
+      font-weight: bold;
+      text-shadow: 2px 2px 6px rgba(0, 0, 0, 0.9);
+      z-index: 10;
+      font-family: Arial, sans-serif;
+    }
+
+    .elapsed-time {
+      position: absolute;
+      bottom: 60px;
+      right: 60px;
+      color: white;
+      font-size: 48px;
+      font-weight: bold;
+      text-shadow: 2px 2px 6px rgba(0, 0, 0, 0.9);
+      z-index: 10;
+      font-family: Arial, sans-serif;
+    }
+
     /* Animation for fill based on current time */
     @keyframes fillProgress {
       from {
@@ -503,15 +749,111 @@ function generateHTMLTemplate(
 <body>
   <div class="background-bar"></div>
   ${segmentHTML}
+  <div class="heart-rate">
+    <span class="heart-rate-label">HR</span>
+    <span class="heart-rate-value" id="heartRateValue">--</span>
+    <span style="font-size: 48px; margin-left: 5px;">bpm</span>
+  </div>
+  <div class="distance-bar-container">
+    <div class="distance-bar-background"></div>
+    <div class="distance-bar-fill" id="distanceBarFill"></div>
+    <div class="distance-value" id="distanceValue">--</div>
+  </div>
+  <div class="current-pace" id="currentPace">--</div>
+  <div class="elapsed-time" id="elapsedTime">0</div>
 
   <script>
+    // Heart rate data - array of {time: seconds, heartRate: bpm}
+    const heartRateData = ${JSON.stringify(heartRateData || [])};
+    
+    // Distance data - array of {time: seconds, distance: meters}, totalDistance in meters
+    const distanceData = ${JSON.stringify(
+      (distanceData && distanceData.distanceData) || []
+    )};
+    const totalDistance = ${distanceData ? distanceData.totalDistance || 0 : 0};
+    
+    // Pace data - array of {time: seconds, pace: minutesPerMile}
+    const paceData = ${JSON.stringify(
+      (distanceData && distanceData.paceData) || []
+    )};
+    
     // Animation control
     const segments = document.querySelectorAll('.segment-fill');
+    const heartRateElement = document.getElementById('heartRateValue');
+    const distanceBarFill = document.getElementById('distanceBarFill');
+    const distanceValue = document.getElementById('distanceValue');
+    const currentPaceElement = document.getElementById('currentPace');
+    const elapsedTimeElement = document.getElementById('elapsedTime');
     let currentTime = 0;
     const totalDuration = ${videoDuration};
 
+    function getHeartRateAtTime(time) {
+      if (!heartRateData || heartRateData.length === 0) return null;
+      
+      // Find closest heart rate value for given time
+      let closest = heartRateData[0];
+      let minDiff = Math.abs(time - closest.time);
+      
+      for (let i = 1; i < heartRateData.length; i++) {
+        const diff = Math.abs(time - heartRateData[i].time);
+        if (diff < minDiff) {
+          minDiff = diff;
+          closest = heartRateData[i];
+        }
+        // If we've passed the time, break (assuming data is sorted)
+        if (heartRateData[i].time > time && minDiff < 1) break;
+      }
+      
+      // Only return if within 2 seconds (for interpolation)
+      return minDiff <= 2 ? closest.heartRate : null;
+    }
+
+    function getDistanceAtTime(time) {
+      if (!distanceData || distanceData.length === 0 || totalDistance === 0) return null;
+      
+      // Find closest distance value for given time
+      let closest = distanceData[0];
+      let minDiff = Math.abs(time - closest.time);
+      
+      for (let i = 1; i < distanceData.length; i++) {
+        const diff = Math.abs(time - distanceData[i].time);
+        if (diff < minDiff) {
+          minDiff = diff;
+          closest = distanceData[i];
+        }
+        // If we've passed the time, break (assuming data is sorted)
+        if (distanceData[i].time > time && minDiff < 1) break;
+      }
+      
+      // Only return if within 2 seconds
+      return minDiff <= 2 ? closest.distance : null;
+    }
+
+    function getPaceAtTime(time) {
+      if (!paceData || paceData.length === 0) return null;
+      
+      // Find closest pace value for given time
+      let closest = paceData[0];
+      let minDiff = Math.abs(time - closest.time);
+      
+      for (let i = 1; i < paceData.length; i++) {
+        const diff = Math.abs(time - paceData[i].time);
+        if (diff < minDiff) {
+          minDiff = diff;
+          closest = paceData[i];
+        }
+        // If we've passed the time, break (assuming data is sorted)
+        if (paceData[i].time > time && minDiff < 1) break;
+      }
+      
+      // Only return if within 2 seconds
+      return minDiff <= 2 ? closest.pace : null;
+    }
+
     function updateFrame(time) {
       currentTime = time;
+      
+      // Update progress bars
       segments.forEach(fill => {
         const start = parseFloat(fill.dataset.start);
         const duration = parseFloat(fill.dataset.duration);
@@ -526,6 +868,53 @@ function generateHTMLTemplate(
           fill.style.width = progress + '%';
         }
       });
+
+      // Update heart rate
+      const hr = getHeartRateAtTime(time);
+      if (heartRateElement) {
+        heartRateElement.textContent = hr !== null ? Math.round(hr) : '--';
+      }
+
+      // Update distance progress bar
+      const currentDistance = getDistanceAtTime(time);
+      if (distanceBarFill && distanceValue && totalDistance > 0) {
+        if (currentDistance !== null) {
+          // Calculate progress percentage
+          const progress = (currentDistance / totalDistance) * 100;
+          distanceBarFill.style.width = Math.min(progress, 100) + '%';
+          
+          // Format distance: convert meters to miles and format to one decimal place
+          const miles = currentDistance / 1609.34; // meters to miles
+          distanceValue.textContent = miles.toFixed(1) + ' miles';
+        } else {
+          distanceBarFill.style.width = '0%';
+          distanceValue.textContent = '--';
+        }
+      }
+
+      // Update current pace (display in minutes/mile format like "Pace: 7:30 min/mile")
+      const currentPace = getPaceAtTime(time);
+      if (currentPaceElement) {
+        if (currentPace !== null && currentPace > 0) {
+          const mins = Math.floor(currentPace);
+          const secs = Math.round((currentPace - mins) * 60);
+          currentPaceElement.textContent = 'Pace: ' + mins + ':' + secs.toString().padStart(2, '0') + ' min/mile';
+        } else {
+          currentPaceElement.textContent = 'Pace: --';
+        }
+      }
+
+      // Update elapsed time (display in standard time format HH:MM:SS)
+      if (elapsedTimeElement) {
+        const hours = Math.floor(time / 3600);
+        const minutes = Math.floor((time % 3600) / 60);
+        const seconds = Math.floor(time % 60);
+        if (hours > 0) {
+          elapsedTimeElement.textContent = hours + ':' + minutes.toString().padStart(2, '0') + ':' + seconds.toString().padStart(2, '0');
+        } else {
+          elapsedTimeElement.textContent = minutes + ':' + seconds.toString().padStart(2, '0');
+        }
+      }
 
       // Store current time for frame capture
       window.__currentTime = time;
@@ -718,6 +1107,8 @@ async function createGreenMp4(
   segments,
   totalDurationForSizing,
   saveHtml,
+  heartRateData,
+  distanceData,
   callback
 ) {
   // Create a solid green 4K background video with progress bar overlay
@@ -755,7 +1146,9 @@ async function createGreenMp4(
       totalDurationForSizing || duration,
       width,
       height,
-      duration
+      duration,
+      heartRateData || [],
+      distanceData || { distanceData: [], totalDistance: 0 }
     );
 
     const htmlPath = path.join(tempDir, "template.html");
@@ -1009,6 +1402,21 @@ async function main() {
       }
 
       // Otherwise, create the video (pass original duration for proportional sizing)
+      // Extract heart rate and distance data
+      console.log("Extracting heart rate data...");
+      const heartRateData = await extractHeartRateData(resolvedPath);
+      console.log(`Extracted ${heartRateData.length} heart rate data points`);
+
+      console.log("Extracting distance data...");
+      const distanceData = await extractDistanceData(resolvedPath);
+      console.log(
+        `Extracted ${
+          distanceData.distanceData.length
+        } distance data points (total: ${(
+          distanceData.totalDistance / 1609.34
+        ).toFixed(2)} miles)`
+      );
+
       createGreenMp4(
         outputPath,
         duration,
@@ -1016,6 +1424,8 @@ async function main() {
         segments,
         originalDuration,
         saveHtml,
+        heartRateData,
+        distanceData,
         (err) => {
           if (err) {
             console.error("Failed to create video:", err.message);
