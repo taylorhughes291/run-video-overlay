@@ -9,7 +9,7 @@ const FitParser =
 
 function printUsageAndExit() {
   console.error(
-    "Usage: fit-to-video <path-to-file.fit> [--out output.mp4] [--fps 2] [--dev-mode] [--save-html]"
+    "Usage: fit-to-video <path-to-file.fit> [--out output.mp4] [--fps 1] [--dev-mode] [--save-html]"
   );
   process.exit(1);
 }
@@ -18,7 +18,7 @@ function parseArgs(argv) {
   const args = {
     input: null,
     out: null,
-    fps: 2, // Default to 2fps - sufficient for slow progress bar animation
+    fps: 1, // Default to 1fps - sufficient for slow progress bar animation
     devMode: false,
     saveHtml: false,
   };
@@ -493,8 +493,10 @@ function generateHTMLTemplate(
   // Extract pace data from distance data
   const paceData = (distanceData && distanceData.paceData) || [];
   // Calculate segment positions and widths
-  const barHeight = 120;
-  const barY = 40;
+  const barHeight = 84; // 30% smaller than original 120px (120 * 0.7 = 84)
+  const barTopMargin = 60; // Increased from 40 to add some padding above for the label
+  const barBottomMargin = 40; // Keep original bottom margin (was perfect before)
+  const barY = barTopMargin; // Position of bars from top
   const segmentMargin = 20;
   const totalMarginWidth = segmentMargin * (segments.length - 1);
   const availableWidth = width - 200;
@@ -502,10 +504,10 @@ function generateHTMLTemplate(
   const totalDuration = totalDurationForSizing || videoDuration;
 
   // Background bar extends from top to below bars by same distance as top margin + extra space for duration text
-  // Top margin is barY (40px), bars are at barY with height barHeight (120px)
-  // Duration text is below the bars with margin (10px + text height ~30px = ~40px)
-  // So bars end at barY + barHeight (160px), extend barY (40px) + extra 20px below = 220px total
-  const backgroundBarHeight = barY + barHeight + barY + 20; // 40 + 120 + 40 + 20 = 220px
+  // Top margin is barTopMargin (60px), bars are at barY with height barHeight (84px)
+  // Bottom margin is barBottomMargin (40px) + extra 20px below = 60px total bottom
+  // So bars end at barY + barHeight (144px), extend barBottomMargin (40px) + extra 20px below = 204px total
+  const backgroundBarHeight = barTopMargin + barHeight + barBottomMargin + 20; // 60 + 84 + 40 + 20 = 204px
 
   // Generate segment styles and HTML
   let segmentHTML = "";
@@ -537,7 +539,7 @@ function generateHTMLTemplate(
     if (segment.targetPace !== null && segment.targetPace !== undefined) {
       const mins = Math.floor(segment.targetPace);
       const secs = Math.round((segment.targetPace - mins) * 60);
-      paceText = `${mins}:${secs.toString().padStart(2, "0")} min/mile`;
+      paceText = `${mins}:${secs.toString().padStart(2, "0")}`;
     }
 
     // Calculate animation timing
@@ -645,6 +647,18 @@ function generateHTMLTemplate(
       z-index: 10;
     }
 
+    .pace-label {
+      position: absolute;
+      top: 10px;
+      left: 100px;
+      color: white;
+      font-size: 36px;
+      font-weight: bold;
+      text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.8);
+      z-index: 10;
+      font-family: Arial, sans-serif;
+    }
+
     .heart-rate {
       position: absolute;
       bottom: 180px;
@@ -748,6 +762,7 @@ function generateHTMLTemplate(
 </head>
 <body>
   <div class="background-bar"></div>
+  <div class="pace-label">Pace (min/mile)</div>
   ${segmentHTML}
   <div class="heart-rate">
     <span class="heart-rate-label">HR</span>
@@ -759,8 +774,8 @@ function generateHTMLTemplate(
     <div class="distance-bar-fill" id="distanceBarFill"></div>
     <div class="distance-value" id="distanceValue">--</div>
   </div>
-  <div class="current-pace" id="currentPace">--</div>
-  <div class="elapsed-time" id="elapsedTime">0</div>
+  <div class="current-pace" id="currentPace">Current Pace: --</div>
+  <div class="elapsed-time" id="elapsedTime">Elapsed Time: 0</div>
 
   <script>
     // Heart rate data - array of {time: seconds, heartRate: bpm}
@@ -892,27 +907,27 @@ function generateHTMLTemplate(
         }
       }
 
-      // Update current pace (display in minutes/mile format like "Pace: 7:30 min/mile")
+      // Update current pace (display in minutes/mile format like "Current Pace: 7:30")
       const currentPace = getPaceAtTime(time);
       if (currentPaceElement) {
         if (currentPace !== null && currentPace > 0) {
           const mins = Math.floor(currentPace);
           const secs = Math.round((currentPace - mins) * 60);
-          currentPaceElement.textContent = 'Pace: ' + mins + ':' + secs.toString().padStart(2, '0') + ' min/mile';
+          currentPaceElement.textContent = 'Current Pace: ' + mins + ':' + secs.toString().padStart(2, '0');
         } else {
-          currentPaceElement.textContent = 'Pace: --';
+          currentPaceElement.textContent = 'Current Pace: --';
         }
       }
 
-      // Update elapsed time (display in standard time format HH:MM:SS)
+      // Update elapsed time (display in standard time format "Elapsed Time: HH:MM:SS" or "Elapsed Time: MM:SS")
       if (elapsedTimeElement) {
         const hours = Math.floor(time / 3600);
         const minutes = Math.floor((time % 3600) / 60);
         const seconds = Math.floor(time % 60);
         if (hours > 0) {
-          elapsedTimeElement.textContent = hours + ':' + minutes.toString().padStart(2, '0') + ':' + seconds.toString().padStart(2, '0');
+          elapsedTimeElement.textContent = 'Elapsed Time: ' + hours + ':' + minutes.toString().padStart(2, '0') + ':' + seconds.toString().padStart(2, '0');
         } else {
-          elapsedTimeElement.textContent = minutes + ':' + seconds.toString().padStart(2, '0');
+          elapsedTimeElement.textContent = 'Elapsed Time: ' + minutes + ':' + seconds.toString().padStart(2, '0');
         }
       }
 
@@ -1395,6 +1410,48 @@ async function main() {
 
       const { segments, createVideo } = result;
 
+      // If saveHtml is true, only generate and save HTML, skip video creation
+      if (saveHtml) {
+        console.log(
+          "HTML-only mode: Generating HTML template (video will not be created)..."
+        );
+
+        // Extract heart rate and distance data
+        console.log("Extracting heart rate data...");
+        const heartRateData = await extractHeartRateData(resolvedPath);
+        console.log(`Extracted ${heartRateData.length} heart rate data points`);
+
+        console.log("Extracting distance data...");
+        const distanceData = await extractDistanceData(resolvedPath);
+        console.log(
+          `Extracted ${
+            distanceData.distanceData.length
+          } distance data points (total: ${(
+            distanceData.totalDistance / 1609.34
+          ).toFixed(2)} miles)`
+        );
+
+        // Generate HTML template
+        const width = 3840;
+        const height = 2160;
+        const htmlContent = generateHTMLTemplate(
+          segments,
+          originalDuration || duration,
+          width,
+          height,
+          duration,
+          heartRateData || [],
+          distanceData || { distanceData: [], totalDistance: 0 }
+        );
+
+        // Save HTML file
+        const htmlOutputPath = outputPath.replace(/\.mp4$/, ".html");
+        fs.writeFileSync(htmlOutputPath, htmlContent, "utf8");
+        console.log(`HTML template saved to: ${htmlOutputPath}`);
+        console.log("Done!");
+        process.exit(0);
+      }
+
       // If they don't want to create video, show detailed data and exit
       if (!createVideo) {
         displayDryRunData(data, duration, segments);
@@ -1423,7 +1480,7 @@ async function main() {
         fps,
         segments,
         originalDuration,
-        saveHtml,
+        false, // saveHtml is now false since we handled it above
         heartRateData,
         distanceData,
         (err) => {
