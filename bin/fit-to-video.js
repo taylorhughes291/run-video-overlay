@@ -847,22 +847,29 @@ function generateHTMLTemplate(
     function getPaceAtTime(time) {
       if (!paceData || paceData.length === 0) return null;
       
-      // Find closest pace value for given time
-      let closest = paceData[0];
-      let minDiff = Math.abs(time - closest.time);
+      // Calculate 5-second rolling average
+      // Collect all pace values from the last 5 seconds (time - 5 to time)
+      const windowStart = Math.max(0, time - 5);
+      const windowEnd = time;
+      const paceValues = [];
       
-      for (let i = 1; i < paceData.length; i++) {
-        const diff = Math.abs(time - paceData[i].time);
-        if (diff < minDiff) {
-          minDiff = diff;
-          closest = paceData[i];
+      for (let i = 0; i < paceData.length; i++) {
+        const paceTime = paceData[i].time;
+        // Include pace values within the 5-second window
+        if (paceTime >= windowStart && paceTime <= windowEnd) {
+          paceValues.push(paceData[i].pace);
         }
-        // If we've passed the time, break (assuming data is sorted)
-        if (paceData[i].time > time && minDiff < 1) break;
+        // If we've passed the window, we can break early (assuming data is sorted)
+        if (paceTime > windowEnd) break;
       }
       
-      // Only return if within 2 seconds
-      return minDiff <= 2 ? closest.pace : null;
+      // Return average if we have at least one value
+      if (paceValues.length > 0) {
+        const sum = paceValues.reduce((acc, val) => acc + val, 0);
+        return sum / paceValues.length;
+      }
+      
+      return null;
     }
 
     function updateFrame(time) {
