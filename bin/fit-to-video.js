@@ -371,16 +371,15 @@ function extractHeartRateData(filePath) {
 
       const records = parsedData.records;
       const heartRateData = [];
-      const startTime = records[0].timestamp
-        ? new Date(records[0].timestamp).getTime()
-        : null;
 
       records.forEach((record) => {
-        if (record.heart_rate !== undefined && record.timestamp && startTime) {
-          const recordTime = new Date(record.timestamp).getTime();
-          const elapsed = (recordTime - startTime) / 1000; // seconds
+        // Use timer_time instead of timestamp-based elapsed time to exclude paused time
+        if (
+          record.heart_rate !== undefined &&
+          record.timer_time !== undefined
+        ) {
           heartRateData.push({
-            time: elapsed,
+            time: record.timer_time, // timer_time excludes paused time
             heartRate: record.heart_rate,
           });
         }
@@ -413,23 +412,20 @@ function extractDistanceData(filePath) {
       const records = parsedData.records;
       const distanceData = [];
       const paceData = [];
-      const startTime = records[0].timestamp
-        ? new Date(records[0].timestamp).getTime()
-        : null;
       let totalDistance = 0;
       let lastDistance = 0;
-      let lastTime = 0;
+      let lastTimerTime = 0;
 
       records.forEach((record, index) => {
-        if (record.timestamp && startTime) {
-          const recordTime = new Date(record.timestamp).getTime();
-          const elapsed = (recordTime - startTime) / 1000; // seconds
+        // Use timer_time instead of timestamp-based elapsed time to exclude paused time
+        if (record.timer_time !== undefined) {
+          const timerTime = record.timer_time; // timer_time excludes paused time
 
           if (record.distance !== undefined) {
             // Distance is cumulative in meters
             totalDistance = record.distance;
             distanceData.push({
-              time: elapsed,
+              time: timerTime,
               distance: record.distance, // in meters
             });
 
@@ -437,24 +433,24 @@ function extractDistanceData(filePath) {
             // Pace = time per mile = (time change in minutes) / (distance change in miles)
             if (
               index > 0 &&
-              elapsed > lastTime &&
+              timerTime > lastTimerTime &&
               record.distance > lastDistance
             ) {
-              const timeDiffMinutes = (elapsed - lastTime) / 60;
+              const timeDiffMinutes = (timerTime - lastTimerTime) / 60;
               const distanceDiffMiles =
                 (record.distance - lastDistance) / 1609.34;
 
               if (distanceDiffMiles > 0) {
                 const paceMinutesPerMile = timeDiffMinutes / distanceDiffMiles;
                 paceData.push({
-                  time: elapsed,
+                  time: timerTime,
                   pace: paceMinutesPerMile, // minutes per mile
                 });
               }
             }
 
             lastDistance = record.distance;
-            lastTime = elapsed;
+            lastTimerTime = timerTime;
           } else if (
             record.enhanced_speed !== undefined &&
             record.enhanced_speed > 0
@@ -465,7 +461,7 @@ function extractDistanceData(filePath) {
             const speedMph = (record.enhanced_speed * 3600) / 1609.34;
             const paceMinutesPerMile = 60 / speedMph; // minutes per mile
             paceData.push({
-              time: elapsed,
+              time: timerTime,
               pace: paceMinutesPerMile,
             });
           }
