@@ -9,7 +9,7 @@ const FitParser =
 
 function printUsageAndExit() {
   console.error(
-    "Usage: fit-to-video <path-to-file.fit> [--out output.mp4] [--fps 1] [--dev-mode] [--save-html]"
+    "Usage: fit-to-video <path-to-file.fit> [--out output.mp4] [--fps 1] [--dev-mode] [--save-html]",
   );
   process.exit(1);
 }
@@ -148,8 +148,8 @@ async function promptForTargetPaces(laps) {
     if (lapDuration < 5) {
       console.log(
         `Skipping lap ${i + 1} (too short: ${(lapDuration / 60).toFixed(
-          1
-        )} min)`
+          1,
+        )} min)`,
       );
       continue;
     }
@@ -224,7 +224,7 @@ async function promptForTargetPaces(laps) {
     while (targetPaceMinutes === null) {
       const answer = await askQuestion(
         rl,
-        `  What is the target pace for this segment? (format: 7:30 or 7.5 min/mile, or 'skip'): `
+        `  What is the target pace for this segment? (format: 7:30 or 7.5 min/mile, or 'skip'): `,
       );
 
       if (answer.toLowerCase() === "skip" || answer === "") {
@@ -237,7 +237,7 @@ async function promptForTargetPaces(laps) {
         console.log("  Invalid format. Please use format like '7:30' or '7.5'");
       } else {
         console.log(
-          `  Set target pace: ${formatPace(targetPaceMinutes)} min/mile`
+          `  Set target pace: ${formatPace(targetPaceMinutes)} min/mile`,
         );
       }
     }
@@ -260,7 +260,7 @@ async function promptForTargetPaces(laps) {
     console.log(
       `${i + 1}. ${seg.name}: ${(seg.duration / 60).toFixed(1)} min${
         seg.targetPace ? ` @ ${formatPace(seg.targetPace)} pace` : ""
-      }`
+      }`,
     );
   });
 
@@ -276,7 +276,7 @@ async function promptForTargetPaces(laps) {
   // Ask if they want to create the video
   const createVideo = await askQuestion(
     rl,
-    "\nDo you want to create the video? (y/n): "
+    "\nDo you want to create the video? (y/n): ",
   );
   rl.close();
 
@@ -285,7 +285,7 @@ async function promptForTargetPaces(laps) {
     createVideo.toLowerCase() !== "yes"
   ) {
     console.log(
-      "\nVideo creation skipped. Data was gathered but no video will be created."
+      "\nVideo creation skipped. Data was gathered but no video will be created.",
     );
     return { segments, createVideo: false };
   }
@@ -477,6 +477,53 @@ function extractDistanceData(filePath) {
   });
 }
 
+function extractElevationGainData(filePath) {
+  const content = fs.readFileSync(filePath);
+  const parser = new FitParser({
+    force: true,
+    speedUnit: "m/s",
+    lengthUnit: "m",
+    temperatureUnit: "celsius",
+    elapsedRecordField: true,
+    mode: "both",
+  });
+
+  return new Promise((resolve) => {
+    parser.parse(content, (err, parsedData) => {
+      if (err || !parsedData.records || parsedData.records.length === 0) {
+        resolve({ totalGainMeters: 0, totalGainFeet: 0 });
+        return;
+      }
+
+      const records = parsedData.records;
+      let lastAlt = null;
+      let totalGainMeters = 0;
+      const minStepMeters = 0.5; // simple noise floor to reduce GPS/barometer jitter
+
+      for (const record of records) {
+        const alt =
+          record.enhanced_altitude ??
+          record.altitude ??
+          record.enhanced_altitude; // (duplicate fallback, harmless)
+
+        if (alt === undefined || alt === null || Number.isNaN(alt)) continue;
+
+        if (lastAlt !== null) {
+          const delta = alt - lastAlt;
+          if (delta > minStepMeters) totalGainMeters += delta;
+        }
+        lastAlt = alt;
+      }
+
+      const totalGainFeet = totalGainMeters * 3.28084;
+      resolve({
+        totalGainMeters,
+        totalGainFeet,
+      });
+    });
+  });
+}
+
 function generateHTMLTemplate(
   segments,
   totalDurationForSizing,
@@ -484,7 +531,8 @@ function generateHTMLTemplate(
   height,
   videoDuration,
   heartRateData,
-  distanceData
+  distanceData,
+  elevationData,
 ) {
   // Extract pace data from distance data
   const paceData = (distanceData && distanceData.paceData) || [];
@@ -745,6 +793,19 @@ function generateHTMLTemplate(
       font-family: Arial, sans-serif;
     }
 
+    .elevation-gain {
+      position: absolute;
+      bottom: 220px;
+      right: 60px;
+      color: white;
+      font-size: 48px;
+      font-weight: bold;
+      text-shadow: 2px 2px 6px rgba(0, 0, 0, 0.9);
+      z-index: 10;
+      font-family: Arial, sans-serif;
+      white-space: nowrap;
+    }
+
     /* Animation for fill based on current time */
     @keyframes fillProgress {
       from {
@@ -757,9 +818,6 @@ function generateHTMLTemplate(
   </style>
 </head>
 <body>
-  <div class="background-bar"></div>
-  <div class="pace-label">Pace (min/mile)</div>
-  ${segmentHTML}
   <div class="heart-rate">
     <span class="heart-rate-label">HR</span>
     <span class="heart-rate-value" id="heartRateValue">--</span>
@@ -770,6 +828,7 @@ function generateHTMLTemplate(
     <div class="distance-bar-fill" id="distanceBarFill"></div>
     <div class="distance-value" id="distanceValue">--</div>
   </div>
+  <div class="elevation-gain" id="elevationGain">Elevation Gain: --</div>
   <div class="current-pace" id="currentPace">Current Pace: --</div>
   <div class="elapsed-time" id="elapsedTime">Elapsed Time: 0</div>
 
@@ -779,24 +838,38 @@ function generateHTMLTemplate(
     
     // Distance data - array of {time: seconds, distance: meters}, totalDistance in meters
     const distanceData = ${JSON.stringify(
-      (distanceData && distanceData.distanceData) || []
+      (distanceData && distanceData.distanceData) || [],
     )};
     const totalDistance = ${distanceData ? distanceData.totalDistance || 0 : 0};
     
     // Pace data - array of {time: seconds, pace: minutesPerMile}
     const paceData = ${JSON.stringify(
-      (distanceData && distanceData.paceData) || []
+      (distanceData && distanceData.paceData) || [],
     )};
+
+    // Elevation summary (static)
+    const totalElevationGainFeet = ${elevationData ? elevationData.totalGainFeet || 0 : 0};
     
     // Animation control
     const segments = document.querySelectorAll('.segment-fill');
     const heartRateElement = document.getElementById('heartRateValue');
     const distanceBarFill = document.getElementById('distanceBarFill');
     const distanceValue = document.getElementById('distanceValue');
+    const elevationGainElement = document.getElementById('elevationGain');
     const currentPaceElement = document.getElementById('currentPace');
     const elapsedTimeElement = document.getElementById('elapsedTime');
     let currentTime = 0;
     const totalDuration = ${videoDuration};
+
+    // Set elevation gain once (no per-frame updates needed)
+    if (elevationGainElement) {
+      if (totalElevationGainFeet > 0) {
+        elevationGainElement.textContent =
+          'Elevation Gain: ' + Math.round(totalElevationGainFeet).toLocaleString() + ' ft';
+      } else {
+        elevationGainElement.textContent = 'Elevation Gain: --';
+      }
+    }
 
     function getHeartRateAtTime(time) {
       if (!heartRateData || heartRateData.length === 0) return null;
@@ -954,7 +1027,7 @@ async function captureFrames(
   duration,
   fps,
   width,
-  height
+  height,
 ) {
   console.log("Launching browser for frame capture...");
   const browser = await puppeteer.launch({
@@ -966,9 +1039,6 @@ async function captureFrames(
     const page = await browser.newPage();
     await page.setViewport({ width, height });
     await page.goto(`file://${htmlPath}`);
-
-    // Wait for page to load
-    await page.waitForSelector(".segment", { timeout: 5000 });
 
     const totalFrames = Math.ceil(duration * fps);
     const frameTime = 1 / fps;
@@ -988,7 +1058,7 @@ async function captureFrames(
       // Capture frame immediately - no wait needed for headless browser
       const framePath = path.join(
         outputFramesDir,
-        `frame_${String(frameIndex).padStart(6, "0")}.png`
+        `frame_${String(frameIndex).padStart(6, "0")}.png`,
       );
       await page.screenshot({
         path: framePath,
@@ -1003,7 +1073,7 @@ async function captureFrames(
       ) {
         const percent = (((frameIndex + 1) / totalFrames) * 100).toFixed(1);
         console.log(
-          `  Captured ${frameIndex + 1}/${totalFrames} frames (${percent}%)...`
+          `  Captured ${frameIndex + 1}/${totalFrames} frames (${percent}%)...`,
         );
       }
     }
@@ -1020,7 +1090,7 @@ function createProgressBarFilter(
   width,
   height,
   videoDuration,
-  tempDir
+  tempDir,
 ) {
   // totalDurationForSizing: used for calculating proportional segment widths
   // videoDuration: used for progress indicator movement (may be limited in dev mode)
@@ -1066,7 +1136,7 @@ function createProgressBarFilter(
     // Border thickness: 4 pixels
     const borderThickness = 4;
     filters.push(
-      `drawbox=x=${currentX}:y=${barY}:w=${actualBarWidth}:h=${barHeight}:color=${color}:t=${borderThickness}`
+      `drawbox=x=${currentX}:y=${barY}:w=${actualBarWidth}:h=${barHeight}:color=${color}:t=${borderThickness}`,
     );
 
     // Progress fill for this segment (animates as time progresses)
@@ -1081,7 +1151,7 @@ function createProgressBarFilter(
 
     // Draw filled portion up to current time within this segment
     filters.push(
-      `drawbox=x=${currentX}:y=${barY}:w='${progressFillExpr}':h=${barHeight}:color=${color}@0.8:t=fill`
+      `drawbox=x=${currentX}:y=${barY}:w='${progressFillExpr}':h=${barHeight}:color=${color}@0.8:t=fill`,
     );
 
     // Draw target pace only (centered in segment)
@@ -1103,7 +1173,7 @@ function createProgressBarFilter(
         .replace(/\\/g, "\\\\")
         .replace(/:/g, "\\:");
       filters.push(
-        `drawtext=textfile='${escapedPath}':fontcolor=white:fontsize=48:x=${labelX}:y=${labelY}:box=1:boxcolor=0x000000@0.5:boxborderw=5:fix_bounds=1`
+        `drawtext=textfile='${escapedPath}':fontcolor=white:fontsize=48:x=${labelX}:y=${labelY}:box=1:boxcolor=0x000000@0.5:boxborderw=5:fix_bounds=1`,
       );
     }
 
@@ -1127,14 +1197,15 @@ async function createGreenMp4(
   saveHtml,
   heartRateData,
   distanceData,
-  callback
+  elevationData,
+  callback,
 ) {
   // Create a solid green 4K background video with progress bar overlay
   const width = 3840;
   const height = 2160;
 
   console.log(
-    `Creating video with progress bar: ${duration}s at ${fps}fps -> ${outputPath}`
+    `Creating video with progress bar: ${duration}s at ${fps}fps -> ${outputPath}`,
   );
   if (segments.length > 0) {
     console.log(`Found ${segments.length} workout segments`);
@@ -1142,7 +1213,7 @@ async function createGreenMp4(
       console.log(
         `  ${i + 1}. ${seg.name || seg.type}: ${seg.duration.toFixed(1)}s (${(
           seg.duration / 60
-        ).toFixed(1)} min)`
+        ).toFixed(1)} min)`,
       );
     });
   }
@@ -1166,7 +1237,8 @@ async function createGreenMp4(
       height,
       duration,
       heartRateData || [],
-      distanceData || { distanceData: [], totalDistance: 0 }
+      distanceData || { distanceData: [], totalDistance: 0 },
+      elevationData || { totalGainMeters: 0, totalGainFeet: 0 },
     );
 
     const htmlPath = path.join(tempDir, "template.html");
@@ -1254,8 +1326,8 @@ async function createGreenMp4(
       if (err.code === "ENOENT") {
         callback(
           new Error(
-            "FFmpeg not found. Please install ffmpeg: brew install ffmpeg (macOS) or visit https://ffmpeg.org/download.html"
-          )
+            "FFmpeg not found. Please install ffmpeg: brew install ffmpeg (macOS) or visit https://ffmpeg.org/download.html",
+          ),
         );
       } else {
         callback(err);
@@ -1274,14 +1346,14 @@ function displayDryRunData(data, duration, segments) {
   console.log("\n=== FIT File Data ===");
   console.log(
     `Duration: ${duration.toFixed(2)} seconds (${(duration / 60).toFixed(
-      2
-    )} minutes)`
+      2,
+    )} minutes)`,
   );
 
   const session = data.activity?.sessions?.[0];
   if (session) {
     console.log(
-      `Total distance: ${(session.total_distance || 0).toFixed(2)} m`
+      `Total distance: ${(session.total_distance || 0).toFixed(2)} m`,
     );
     console.log(`Sport: ${session.sport || "unknown"}`);
     console.log(`Number of laps: ${session.laps?.length || 0}`);
@@ -1295,8 +1367,8 @@ function displayDryRunData(data, duration, segments) {
     console.log(`  Type: ${seg.type}`);
     console.log(
       `  Duration: ${seg.duration.toFixed(1)}s (${(seg.duration / 60).toFixed(
-        1
-      )} min)`
+        1,
+      )} min)`,
     );
     console.log(`  Start time: ${seg.startTime.toFixed(1)}s`);
     console.log(`  End time: ${seg.endTime.toFixed(1)}s`);
@@ -1313,7 +1385,7 @@ function displayDryRunData(data, duration, segments) {
   console.log(
     `Total segment duration: ${totalDuration.toFixed(1)}s (${(
       totalDuration / 60
-    ).toFixed(2)} min)`
+    ).toFixed(2)} min)`,
   );
 
   // Summary by type
@@ -1331,8 +1403,8 @@ function displayDryRunData(data, duration, segments) {
     const stats = byType[type];
     console.log(
       `${type}: ${stats.count} segment(s), ${(stats.duration / 60).toFixed(
-        1
-      )} min total`
+        1,
+      )} min total`,
     );
   });
 
@@ -1354,7 +1426,7 @@ async function main() {
     ? path.resolve(process.cwd(), out)
     : path.resolve(
         process.cwd(),
-        path.basename(input, ".fit") + "_overlay.mp4"
+        path.basename(input, ".fit") + "_overlay.mp4",
       );
 
   if (devMode) {
@@ -1390,7 +1462,7 @@ async function main() {
           console.log(
             `Dev mode: Limiting video duration to ${devDuration}s (${(
               devDuration / 60
-            ).toFixed(1)} min) instead of ${duration.toFixed(2)}s`
+            ).toFixed(1)} min) instead of ${duration.toFixed(2)}s`,
           );
           duration = devDuration;
         }
@@ -1416,7 +1488,7 @@ async function main() {
       // If saveHtml is true, only generate and save HTML, skip video creation
       if (saveHtml) {
         console.log(
-          "HTML-only mode: Generating HTML template (video will not be created)..."
+          "HTML-only mode: Generating HTML template (video will not be created)...",
         );
 
         // Extract heart rate and distance data
@@ -1431,7 +1503,15 @@ async function main() {
             distanceData.distanceData.length
           } distance data points (total: ${(
             distanceData.totalDistance / 1609.34
-          ).toFixed(2)} miles)`
+          ).toFixed(2)} miles)`,
+        );
+
+        console.log("Extracting elevation gain...");
+        const elevationData = await extractElevationGainData(resolvedPath);
+        console.log(
+          `Total elevation gain: ${Math.round(
+            elevationData.totalGainFeet || 0,
+          ).toLocaleString()} ft`,
         );
 
         // Generate HTML template
@@ -1444,7 +1524,8 @@ async function main() {
           height,
           duration,
           heartRateData || [],
-          distanceData || { distanceData: [], totalDistance: 0 }
+          distanceData || { distanceData: [], totalDistance: 0 },
+          elevationData || { totalGainMeters: 0, totalGainFeet: 0 },
         );
 
         // Save HTML file
@@ -1474,7 +1555,15 @@ async function main() {
           distanceData.distanceData.length
         } distance data points (total: ${(
           distanceData.totalDistance / 1609.34
-        ).toFixed(2)} miles)`
+        ).toFixed(2)} miles)`,
+      );
+
+      console.log("Extracting elevation gain...");
+      const elevationData = await extractElevationGainData(resolvedPath);
+      console.log(
+        `Total elevation gain: ${Math.round(
+          elevationData.totalGainFeet || 0,
+        ).toLocaleString()} ft`,
       );
 
       createGreenMp4(
@@ -1486,13 +1575,14 @@ async function main() {
         false, // saveHtml is now false since we handled it above
         heartRateData,
         distanceData,
+        elevationData,
         (err) => {
           if (err) {
             console.error("Failed to create video:", err.message);
             process.exit(4);
           }
           console.log("Done!");
-        }
+        },
       );
     } catch (err) {
       console.error("Error:", err.message);
