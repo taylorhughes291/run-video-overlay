@@ -127,6 +127,82 @@ function askQuestion(rl, question) {
 }
 
 async function promptForTargetPaces(laps) {
+  // When stdin isn't a TTY (e.g. piping/automation), interactive prompts are
+  // unreliable. In that case, default to "skip" for all paces and auto-confirm.
+  if (!process.stdin.isTTY) {
+    const segments = [];
+
+    const segmentGroups = [];
+    let currentTime = 0;
+    let intervalNumber = 1;
+
+    for (let i = 0; i < laps.length; i++) {
+      const lap = laps[i];
+      const lapDuration = lap.total_timer_time || lap.total_elapsed_time || 0;
+
+      if (lapDuration < 5) continue;
+
+      const intensity = lap.intensity || "unknown";
+
+      let segmentType = "workout";
+      let segmentName = "";
+
+      if (i === 0 || intensity === "warmup") {
+        segmentType = "warmup";
+        segmentName = "Warm Up";
+      } else if (i === laps.length - 1 || intensity === "cooldown") {
+        segmentType = "cooldown";
+        segmentName = "Cool Down";
+      } else if (intensity === "interval") {
+        segmentType = "interval";
+        segmentName = `Interval ${intervalNumber}`;
+        intervalNumber++;
+      } else if (intensity === "recovery" || intensity === "rest") {
+        segmentType = "rest";
+        segmentName = "Rest";
+      } else {
+        segmentType = "workout";
+        segmentName = `Segment ${i + 1}`;
+      }
+
+      const lastGroup = segmentGroups[segmentGroups.length - 1];
+      const shouldCombine =
+        lastGroup &&
+        lastGroup.name === segmentName &&
+        (segmentType === "warmup" || segmentType === "cooldown");
+
+      if (shouldCombine) {
+        lastGroup.duration += lapDuration;
+        lastGroup.lapIndices.push(i);
+      } else {
+        segmentGroups.push({
+          type: segmentType,
+          name: segmentName,
+          startTime: currentTime,
+          duration: lapDuration,
+          lapIndices: [i],
+        });
+      }
+
+      currentTime += lapDuration;
+    }
+
+    let segmentStartTime = 0;
+    for (const group of segmentGroups) {
+      segments.push({
+        type: group.type,
+        name: group.name,
+        startTime: segmentStartTime,
+        duration: group.duration,
+        endTime: segmentStartTime + group.duration,
+        targetPace: null,
+      });
+      segmentStartTime += group.duration;
+    }
+
+    return { segments, createVideo: true };
+  }
+
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -490,35 +566,135 @@ function extractElevationGainData(filePath) {
 
   return new Promise((resolve) => {
     parser.parse(content, (err, parsedData) => {
-      if (err || !parsedData.records || parsedData.records.length === 0) {
-        resolve({ totalGainMeters: 0, totalGainFeet: 0 });
+      if (err) {
+        resolve({
+          totalGainMeters: 0,
+          totalGainFeet: 0,
+          hasElevation: false,
+          gainTimeline: [],
+        });
         return;
       }
 
+      // Summary ascent fields (useful fallback; timeline comes from records if possible)
+      const session = parsedData.activity?.sessions?.[0];
+      const sessionAscent = session?.total_ascent;
+      const summaryAscentMeters =
+        typeof sessionAscent === "number" && Number.isFinite(sessionAscent)
+          ? sessionAscent
+          : null;
+
+      // Some devices store ascent per lap
+      let lapAscentSum = 0;
+      let sawLapAscent = false;
+      if (
+        session?.laps &&
+        Array.isArray(session.laps) &&
+        session.laps.length > 0
+      ) {
+        for (const lap of session.laps) {
+          if (
+            typeof lap?.total_ascent === "number" &&
+            Number.isFinite(lap.total_ascent)
+          ) {
+            lapAscentSum += lap.total_ascent;
+            sawLapAscent = true;
+          }
+        }
+      }
+      const lapSummaryAscentMeters = sawLapAscent ? lapAscentSum : null;
+      const summaryTotalAscentMeters = summaryAscentMeters ?? lapSummaryAscentMeters;
+
       const records = parsedData.records;
+      if (!records || records.length === 0) {
+        const fallbackMeters = summaryTotalAscentMeters ?? 0;
+        resolve({
+          totalGainMeters: fallbackMeters,
+          totalGainFeet: fallbackMeters * 3.28084,
+          hasElevation: summaryTotalAscentMeters !== null,
+          gainTimeline: [],
+        });
+        return;
+      }
+
       let lastAlt = null;
       let totalGainMeters = 0;
-      const minStepMeters = 0.5; // simple noise floor to reduce GPS/barometer jitter
+      let sawAltitude = false;
+      // We smooth altitude a bit to reduce barometer/GPS jitter; then we use a
+      // very small/no noise floor and, when available, scale to session/lap
+      // `total_ascent` so the end-of-video total matches the device summary.
+      const smoothingAlpha = 0.1; // low-pass filter strength (0..1); higher = less smoothing
+      const minStepMeters = 0.05; // tiny floor after smoothing
+      const gainTimeline = [];
+      let smoothedAlt = null;
 
       for (const record of records) {
         const alt =
           record.enhanced_altitude ??
-          record.altitude ??
-          record.enhanced_altitude; // (duplicate fallback, harmless)
+          record.altitude;
 
         if (alt === undefined || alt === null || Number.isNaN(alt)) continue;
+        sawAltitude = true;
+
+        smoothedAlt =
+          smoothedAlt === null ? alt : smoothingAlpha * alt + (1 - smoothingAlpha) * smoothedAlt;
 
         if (lastAlt !== null) {
-          const delta = alt - lastAlt;
+          const delta = smoothedAlt - lastAlt;
           if (delta > minStepMeters) totalGainMeters += delta;
         }
-        lastAlt = alt;
+        lastAlt = smoothedAlt;
+
+        // Use timer_time if present so we stay consistent with other overlays
+        const t = record.timer_time ?? record.elapsed_time ?? null;
+        if (t !== null && Number.isFinite(t)) {
+          gainTimeline.push({
+            time: t,
+            gainMeters: totalGainMeters,
+            gainFeet: totalGainMeters * 3.28084,
+          });
+        }
+      }
+
+      // If we couldn't build a timeline (no altitude), fall back to summary ascent if available
+      if (!sawAltitude) {
+        const fallbackMeters = summaryTotalAscentMeters ?? 0;
+        resolve({
+          totalGainMeters: fallbackMeters,
+          totalGainFeet: fallbackMeters * 3.28084,
+          hasElevation: summaryTotalAscentMeters !== null,
+          gainTimeline: [],
+        });
+        return;
+      }
+
+      // Ensure monotonic time order (defensive)
+      gainTimeline.sort((a, b) => a.time - b.time);
+
+      // If the FIT provides summary ascent, treat it as authoritative and scale
+      // the timeline so the end-of-video value matches that summary.
+      if (
+        summaryTotalAscentMeters !== null &&
+        gainTimeline.length > 0 &&
+        totalGainMeters > 0
+      ) {
+        const scale = summaryTotalAscentMeters / totalGainMeters;
+        for (const p of gainTimeline) {
+          p.gainMeters *= scale;
+          p.gainFeet *= scale;
+        }
+        totalGainMeters = summaryTotalAscentMeters;
+      } else if (summaryTotalAscentMeters !== null && totalGainMeters === 0) {
+        // We have summary ascent but record-derived gain is unusable.
+        totalGainMeters = summaryTotalAscentMeters;
       }
 
       const totalGainFeet = totalGainMeters * 3.28084;
       resolve({
         totalGainMeters,
         totalGainFeet,
+        hasElevation: true,
+        gainTimeline,
       });
     });
   });
@@ -847,8 +1023,12 @@ function generateHTMLTemplate(
       (distanceData && distanceData.paceData) || [],
     )};
 
-    // Elevation summary (static)
+    // Elevation gain data: overall + timeline
     const totalElevationGainFeet = ${elevationData ? elevationData.totalGainFeet || 0 : 0};
+    const hasElevation = ${elevationData ? Boolean(elevationData.hasElevation) : false};
+    const elevationGainTimeline = ${JSON.stringify(
+      (elevationData && elevationData.gainTimeline) || [],
+    )};
     
     // Animation control
     const segments = document.querySelectorAll('.segment-fill');
@@ -861,14 +1041,19 @@ function generateHTMLTemplate(
     let currentTime = 0;
     const totalDuration = ${videoDuration};
 
-    // Set elevation gain once (no per-frame updates needed)
-    if (elevationGainElement) {
-      if (totalElevationGainFeet > 0) {
-        elevationGainElement.textContent =
-          'Elevation Gain: ' + Math.round(totalElevationGainFeet).toLocaleString() + ' ft';
-      } else {
-        elevationGainElement.textContent = 'Elevation Gain: --';
+    function getElevationGainAtTime(time) {
+      if (!hasElevation || !elevationGainTimeline || elevationGainTimeline.length === 0) {
+        return null;
       }
+
+      // Find the last timeline point at or before this time
+      let last = elevationGainTimeline[0];
+      for (let i = 1; i < elevationGainTimeline.length; i++) {
+        const point = elevationGainTimeline[i];
+        if (point.time > time) break;
+        last = point;
+      }
+      return last ? last.gainFeet : null;
     }
 
     function getHeartRateAtTime(time) {
@@ -1004,6 +1189,23 @@ function generateHTMLTemplate(
           elapsedTimeElement.textContent = 'Elapsed Time: ' + hours + ':' + minutes.toString().padStart(2, '0') + ':' + seconds.toString().padStart(2, '0');
         } else {
           elapsedTimeElement.textContent = 'Elapsed Time: ' + minutes + ':' + seconds.toString().padStart(2, '0');
+        }
+      }
+
+      // Update elevation gain (dynamic, based on current time)
+      if (elevationGainElement) {
+        if (!hasElevation) {
+          elevationGainElement.textContent = 'Elevation Gain: --';
+        } else {
+          const gainFeet = getElevationGainAtTime(time);
+          if (gainFeet !== null && Number.isFinite(gainFeet)) {
+            elevationGainElement.textContent =
+              'Elevation Gain: ' + Math.ceil(gainFeet).toLocaleString() + ' ft';
+          } else {
+            // Fallback to total gain when we don't have a timeline point yet
+            elevationGainElement.textContent =
+              'Elevation Gain: ' + Math.ceil(totalElevationGainFeet).toLocaleString() + ' ft';
+          }
         }
       }
 
@@ -1509,7 +1711,7 @@ async function main() {
         console.log("Extracting elevation gain...");
         const elevationData = await extractElevationGainData(resolvedPath);
         console.log(
-          `Total elevation gain: ${Math.round(
+          `Total elevation gain: ${Math.ceil(
             elevationData.totalGainFeet || 0,
           ).toLocaleString()} ft`,
         );
@@ -1561,7 +1763,7 @@ async function main() {
       console.log("Extracting elevation gain...");
       const elevationData = await extractElevationGainData(resolvedPath);
       console.log(
-        `Total elevation gain: ${Math.round(
+        `Total elevation gain: ${Math.ceil(
           elevationData.totalGainFeet || 0,
         ).toLocaleString()} ft`,
       );
